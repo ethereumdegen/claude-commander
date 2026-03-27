@@ -606,7 +606,7 @@ impl HypertilePlugin for ClaudePlugin {
                 let is_resume = session.prompt_count > 1;
 
                 let plugin_sid = self.session_id;
-                debug_log(format!("[session {}] Sending prompt: {}", plugin_sid, &prompt[..prompt.len().min(80)]));
+                debug_log(format!("[session {}] Sending prompt: {}", plugin_sid, claude::truncate_chars(&prompt, 80)));
 
                 // If no process is running, spawn one
                 if session.process_stdin.is_none() {
@@ -1514,7 +1514,7 @@ impl HypertilePlugin for DebugPlugin {
                     drop(state);
                     match copy_to_clipboard(&text) {
                         Ok(_) => debug_log(format!("[debug] Copied log entry to clipboard: {}",
-                            &text[..text.len().min(60)])),
+                            claude::truncate_chars(&text, 60))),
                         Err(e) => debug_log(format!("[debug] clipboard copy failed: {e}")),
                     }
                 } else {
@@ -1671,7 +1671,7 @@ impl HypertilePlugin for SessionListPlugin {
                 let sid_display = session
                     .session_id
                     .as_deref()
-                    .map(|s| &s[..s.len().min(12)])
+                    .map(|s| claude::truncate_chars(s, 12))
                     .unwrap_or("(new)");
 
                 let row_bg = if is_selected {

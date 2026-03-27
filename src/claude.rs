@@ -6,6 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
+/// Truncate a string to at most `max_chars` characters, respecting char boundaries.
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 // ── Stream event types ──
 
 /// A single question option from AskUserQuestion
@@ -251,7 +259,7 @@ impl ClaudeSession {
                                 if line.starts_with("[tool_use: ") {
                                     debug_log(format!("[session {}] {}", sid, line));
                                 } else if line.starts_with("[tool_result") {
-                                    let preview = &line[..line.len().min(120)];
+                                    let preview = truncate_chars(&line, 120);
                                     debug_log(format!("[session {}] {}", sid, preview));
                                 }
                             }
@@ -271,7 +279,7 @@ impl ClaudeSession {
                                 sid,
                                 req.tool_name,
                                 has_questions,
-                                &req.input_preview[..req.input_preview.len().min(120)]
+                                truncate_chars(&req.input_preview, 120)
                             ));
                             self.state = SessionState::AwaitingPermission(req);
                         }
@@ -285,7 +293,7 @@ impl ClaudeSession {
                             self.scroll_offset = 0;
                             // Check for queued prompt before going idle
                             if let Some(queued) = self.queued_prompt.take() {
-                                debug_log(format!("[session {}] Sending queued prompt: {}", sid, &queued[..queued.len().min(80)]));
+                                debug_log(format!("[session {}] Sending queued prompt: {}", sid, truncate_chars(&queued, 80)));
                                 self.prepare_prompt(&queued);
                                 if let Some(ref stdin) = self.process_stdin {
                                     let stdin = Arc::clone(stdin);
@@ -303,7 +311,7 @@ impl ClaudeSession {
                         }
                         StreamEvent::Stderr(line) => {
                             if !line.trim().is_empty() {
-                                debug_log(format!("[session {}] stderr: {}", sid, &line[..line.len().min(150)]));
+                                debug_log(format!("[session {}] stderr: {}", sid, truncate_chars(&line, 150)));
                                 self.output_lines.push(format!("  [stderr] {}", line));
                             }
                         }
@@ -351,7 +359,7 @@ fn parse_stream_line(line: &str) -> StreamEvent {
         Ok(v) => v,
         Err(_) => {
             // Not valid JSON — emit as raw stderr so it's visible
-            return StreamEvent::Stderr(format!("[raw] {}", &line[..line.len().min(200)]));
+            return StreamEvent::Stderr(format!("[raw] {}", truncate_chars(&line, 200)));
         }
     };
 
@@ -360,7 +368,7 @@ fn parse_stream_line(line: &str) -> StreamEvent {
         None => {
             return StreamEvent::Stderr(format!(
                 "[no type field] {}",
-                &line[..line.len().min(200)]
+                truncate_chars(&line, 200)
             ));
         }
     };
@@ -555,7 +563,7 @@ pub fn spawn_session_process(
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
                         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
                         let subtype = v.get("subtype").and_then(|t| t.as_str()).unwrap_or("");
-                        let preview = &l[..l.len().min(200)];
+                        let preview = truncate_chars(&l, 200);
                         crate::debug_log(format!("[stream] type={} sub={} | {}", msg_type, subtype, preview));
                     }
                     let event = parse_stream_line(&l);
@@ -606,7 +614,7 @@ pub fn send_prompt_to_process(
         "parent_tool_use_id": null
     });
     let mut line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-    crate::debug_log(format!("[send_prompt] {}", &line[..line.len().min(200)]));
+    crate::debug_log(format!("[send_prompt] {}", truncate_chars(&line, 200)));
     line.push('\n');
 
     let mut guard = stdin.lock().map_err(|e| e.to_string())?;
@@ -657,7 +665,7 @@ pub fn send_permission_response(
         }
     });
     let mut line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
-    crate::debug_log(format!("[ctrl_resp] {}", &line[..line.len().min(300)]));
+    crate::debug_log(format!("[ctrl_resp] {}", truncate_chars(&line, 300)));
     line.push('\n');
 
     let mut guard = stdin.lock().map_err(|e| e.to_string())?;
