@@ -80,6 +80,14 @@ pub struct ClaudeSession {
     pub last_event_time: Option<Instant>,
     /// A prompt queued while the session is busy (sent automatically when idle)
     pub queued_prompt: Option<String>,
+    /// Per-session working directory (None = inherit process cwd)
+    pub workdir: Option<String>,
+    /// Whether the slash-command popup is visible
+    pub slash_popup_visible: bool,
+    /// Currently highlighted index in the slash-command popup
+    pub slash_popup_selected: usize,
+    /// Auto-accept all permission requests (dangerously)
+    pub auto_accept_permissions: bool,
 }
 
 impl ClaudeSession {
@@ -107,7 +115,21 @@ impl ClaudeSession {
             event_rx: None,
             last_event_time: None,
             queued_prompt: None,
+            workdir: None,
+            slash_popup_visible: false,
+            slash_popup_selected: 0,
+            auto_accept_permissions: false,
         }
+    }
+
+    /// Returns the effective working directory for this session.
+    pub fn effective_cwd(&self) -> String {
+        if let Some(ref wd) = self.workdir {
+            return wd.clone();
+        }
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into())
     }
 
     pub fn is_running(&self) -> bool {
@@ -281,7 +303,24 @@ impl ClaudeSession {
                                 has_questions,
                                 truncate_chars(&req.input_preview, 120)
                             ));
-                            self.state = SessionState::AwaitingPermission(req);
+                            if self.auto_accept_permissions && !has_questions {
+                                // Auto-accept: send allow immediately
+                                debug_log(format!("[session {}] Auto-accepting: {}", sid, req.tool_name));
+                                self.output_lines.push(format!("  [auto-accept] {}", req.tool_name));
+                                if let Some(ref stdin) = self.process_stdin {
+                                    let stdin = Arc::clone(stdin);
+                                    let raw_input = req.raw_input.clone();
+                                    if let Err(e) = send_permission_response(
+                                        &stdin, &req.request_id, true, raw_input, None,
+                                    ) {
+                                        debug_log(format!("[session {}] Auto-accept send error: {}", sid, e));
+                                        self.output_lines.push(format!("  [error] {}", e));
+                                        self.force_idle();
+                                    }
+                                }
+                            } else {
+                                self.state = SessionState::AwaitingPermission(req);
+                            }
                         }
                         StreamEvent::Done { cost } => {
                             self.total_cost += cost;

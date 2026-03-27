@@ -134,6 +134,64 @@ fn shared() -> &'static Mutex<SharedState> {
     })
 }
 
+/// Find any session that is awaiting permission and dismiss it.
+/// Returns true if a permission was dismissed (caller should skip hypertile).
+fn dismiss_any_awaiting_permission() -> bool {
+    let state = shared().lock().unwrap();
+    // Find a session that is awaiting permission
+    let awaiting: Option<(usize, Arc<Mutex<claude::ClaudeSession>>)> = state
+        .sessions
+        .iter()
+        .find_map(|(&id, arc)| {
+            let s = arc.lock().unwrap();
+            if s.is_awaiting_permission() {
+                Some((id, Arc::clone(arc)))
+            } else {
+                None
+            }
+        });
+    drop(state);
+
+    let Some((sid, session_arc)) = awaiting else {
+        return false;
+    };
+
+    let mut session = session_arc.lock().unwrap();
+    let (request_id, is_question) = match &session.state {
+        claude::SessionState::AwaitingPermission(req) => {
+            (req.request_id.clone(), !req.questions.is_empty())
+        }
+        _ => return false,
+    };
+
+    let deny_message = if is_question {
+        session.output_lines.push("  [question: dismissed]".into());
+        "User dismissed the question"
+    } else {
+        session.output_lines.push("  [permission: denied]".into());
+        "User denied this action"
+    };
+
+    let stdin_arc = session.process_stdin.as_ref().map(Arc::clone);
+    if let Some(stdin) = stdin_arc {
+        session.state = claude::SessionState::Running;
+        session.last_event_time = Some(std::time::Instant::now());
+        drop(session);
+        if let Err(e) = claude::send_permission_response(
+            &stdin, &request_id, false, None, Some(deny_message),
+        ) {
+            debug_log(format!("[session {}] Send error: {}", sid, e));
+            let mut s = session_arc.lock().unwrap();
+            s.force_idle();
+            s.output_lines.push(format!("  [error] {}", e));
+        }
+    } else {
+        session.force_idle();
+        session.output_lines.push("  [error] process not running".into());
+    }
+    true
+}
+
 fn create_session() -> usize {
     let mut state = shared().lock().unwrap();
     let id = state.next_id;
@@ -298,35 +356,46 @@ impl HypertilePlugin for ClaudePlugin {
             .style(Style::default().bg(tile_bg))
             .render(output_area, buf);
 
-        // Render input box with cwd
-        let cwd = std::env::current_dir()
-            .map(|p| {
-                let s = p.display().to_string();
-                // Shorten home dir to ~
-                if let Some(home) = dirs::home_dir() {
-                    if let Some(rest) = s.strip_prefix(&home.display().to_string()) {
-                        return format!("~{}", rest);
-                    }
-                }
-                s
-            })
-            .unwrap_or_else(|_| "?".into());
+        // Render input box with per-session cwd
+        let raw_cwd = session.effective_cwd();
+        let cwd = if let Some(home) = dirs::home_dir() {
+            if let Some(rest) = raw_cwd.strip_prefix(&home.display().to_string()) {
+                format!("~{}", rest)
+            } else {
+                raw_cwd
+            }
+        } else {
+            raw_cwd
+        };
 
+        let danger = session.auto_accept_permissions;
         let input_title = if is_focused {
-            format!(" {} ▸ ", cwd)
+            if danger {
+                format!(" \u{2620} {} ▸ ", cwd)
+            } else {
+                format!(" {} ▸ ", cwd)
+            }
+        } else if danger {
+            format!(" \u{2620} {} ", cwd)
         } else {
             format!(" {} ", cwd)
         };
 
+        let input_border_color = if danger {
+            theme::RED()
+        } else if is_focused {
+            theme::GREEN()
+        } else {
+            theme::BORDER_NORMAL()
+        };
+
         let input_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if is_focused {
-                theme::GREEN()
-            } else {
-                theme::BORDER_NORMAL()
-            }))
+            .border_style(Style::default().fg(input_border_color))
             .title(input_title)
-            .title_style(Style::default().fg(if is_focused {
+            .title_style(Style::default().fg(if danger {
+                theme::RED()
+            } else if is_focused {
                 theme::GREEN()
             } else {
                 theme::text_muted()
@@ -360,6 +429,11 @@ impl HypertilePlugin for ClaudePlugin {
                         .bg(theme::bg_secondary()),
                 )
                 .render(input_inner, buf);
+        }
+
+        // ── Slash command popup ──
+        if session.slash_popup_visible {
+            render_slash_popup(buf, input_area, &session);
         }
 
         // ── Permission overlay ──
@@ -441,7 +515,27 @@ impl HypertilePlugin for ClaudePlugin {
 
                         Some((request_id, true, updated, None))
                     }
-                    HtKeyCode::Escape => {
+                    HtKeyCode::Char('o') => {
+                        // "Other" — tell Claude the user wants something else
+                        let (request_id, raw_input, questions) = {
+                            if let claude::SessionState::AwaitingPermission(req) = &session.state {
+                                (req.request_id.clone(), req.raw_input.clone(), req.questions.clone())
+                            } else {
+                                return EventOutcome::Consumed;
+                            }
+                        };
+                        let mut answers = serde_json::Map::new();
+                        for q in &questions {
+                            answers.insert(q.question.clone(), serde_json::Value::String("Other".into()));
+                        }
+                        session.output_lines.push("  [answered: Other]".into());
+                        let updated = raw_input.map(|mut input| {
+                            input["answers"] = serde_json::Value::Object(answers);
+                            input
+                        });
+                        Some((request_id, true, updated, None))
+                    }
+                    HtKeyCode::Escape | HtKeyCode::Char('n') => {
                         let request_id = if let claude::SessionState::AwaitingPermission(req) = &session.state {
                             req.request_id.clone()
                         } else {
@@ -504,6 +598,46 @@ impl HypertilePlugin for ClaudePlugin {
             return EventOutcome::Consumed;
         }
 
+        // Slash popup navigation (intercept before scroll/input)
+        if session.slash_popup_visible {
+            let prefix = session.input_buf.trim_start().split_whitespace().next().unwrap_or("").to_string();
+            let matches = filtered_slash_commands(&prefix);
+            match key.code {
+                HtKeyCode::Up => {
+                    if session.slash_popup_selected > 0 {
+                        session.slash_popup_selected -= 1;
+                    } else {
+                        session.slash_popup_selected = matches.len().saturating_sub(1);
+                    }
+                    return EventOutcome::Consumed;
+                }
+                HtKeyCode::Down => {
+                    if session.slash_popup_selected + 1 < matches.len() {
+                        session.slash_popup_selected += 1;
+                    } else {
+                        session.slash_popup_selected = 0;
+                    }
+                    return EventOutcome::Consumed;
+                }
+                HtKeyCode::Tab | HtKeyCode::Enter => {
+                    // Autocomplete selected command
+                    if let Some((name, _)) = matches.get(session.slash_popup_selected) {
+                        session.input_buf = format!("{} ", name);
+                        session.cursor_pos = session.input_buf.len();
+                    }
+                    session.slash_popup_visible = false;
+                    session.slash_popup_selected = 0;
+                    return EventOutcome::Consumed;
+                }
+                HtKeyCode::Escape => {
+                    session.slash_popup_visible = false;
+                    session.slash_popup_selected = 0;
+                    return EventOutcome::Consumed;
+                }
+                _ => {} // fall through for char input etc.
+            }
+        }
+
         // Allow scrolling and cancel even while running
         match key.code {
             HtKeyCode::PageUp | HtKeyCode::Up => {
@@ -533,6 +667,7 @@ impl HypertilePlugin for ClaudePlugin {
                 let pos = session.cursor_pos;
                 session.input_buf.insert(pos, ch);
                 session.cursor_pos = pos + ch.len_utf8();
+                update_slash_popup(&mut session);
                 EventOutcome::Consumed
             }
             HtKeyCode::Backspace => {
@@ -546,6 +681,7 @@ impl HypertilePlugin for ClaudePlugin {
                     session.input_buf.remove(prev);
                     session.cursor_pos = prev;
                 }
+                update_slash_popup(&mut session);
                 EventOutcome::Consumed
             }
             HtKeyCode::Delete => {
@@ -553,6 +689,7 @@ impl HypertilePlugin for ClaudePlugin {
                 if pos < session.input_buf.len() {
                     session.input_buf.remove(pos);
                 }
+                update_slash_popup(&mut session);
                 EventOutcome::Consumed
             }
             HtKeyCode::Left => {
@@ -587,6 +724,106 @@ impl HypertilePlugin for ClaudePlugin {
                 if session.input_buf.trim().is_empty() {
                     return EventOutcome::Consumed;
                 }
+                // Hide slash popup on submit
+                session.slash_popup_visible = false;
+                session.slash_popup_selected = 0;
+
+                let trimmed = session.input_buf.trim().to_string();
+
+                // Handle /clear command
+                if trimmed == "/clear" {
+                    session.output_lines.clear();
+                    session.scroll_offset = 0;
+                    session.input_buf.clear();
+                    session.cursor_pos = 0;
+                    return EventOutcome::Consumed;
+                }
+
+                // Handle /kill command
+                if trimmed == "/kill" {
+                    if let Some(child_arc) = session.process_child.take() {
+                        if let Ok(mut child) = child_arc.lock() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                    session.process_stdin = None;
+                    session.event_rx = None;
+                    session.state = claude::SessionState::Idle;
+                    session.output_lines.push("  [kill] session process terminated".into());
+                    session.input_buf.clear();
+                    session.cursor_pos = 0;
+                    return EventOutcome::Consumed;
+                }
+
+                // Handle /dangerously-skip-permissions toggle
+                if trimmed == "/dangerously-skip-permissions" {
+                    session.auto_accept_permissions = !session.auto_accept_permissions;
+                    let status = if session.auto_accept_permissions { "ON" } else { "OFF" };
+                    session.output_lines.push(format!(
+                        "  [permissions] auto-accept is now {}",
+                        status
+                    ));
+                    session.input_buf.clear();
+                    session.cursor_pos = 0;
+                    return EventOutcome::Consumed;
+                }
+
+                // Handle /cd command to change per-session working directory
+                if trimmed == "/cd" || trimmed.starts_with("/cd ") {
+                    let raw_path = if trimmed == "/cd" {
+                        dirs::home_dir()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "~".into())
+                    } else {
+                        trimmed[4..].trim().to_string()
+                    };
+                    let expanded = if raw_path.starts_with('~') {
+                        if let Some(home) = dirs::home_dir() {
+                            format!("{}{}", home.display(), &raw_path[1..])
+                        } else {
+                            raw_path.clone()
+                        }
+                    } else {
+                        raw_path.clone()
+                    };
+                    let path = std::path::Path::new(&expanded);
+                    if !path.is_dir() {
+                        session.output_lines.push(format!("  [cd] not a directory: {}", expanded));
+                        session.input_buf.clear();
+                        session.cursor_pos = 0;
+                        return EventOutcome::Consumed;
+                    }
+                    let canonical = path.canonicalize()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or(expanded);
+                    session.workdir = Some(canonical.clone());
+                    let display_path = if let Some(home) = dirs::home_dir() {
+                        if let Some(rest) = canonical.strip_prefix(&home.display().to_string()) {
+                            format!("~{}", rest)
+                        } else {
+                            canonical.clone()
+                        }
+                    } else {
+                        canonical.clone()
+                    };
+                    session.output_lines.push(format!("  [cd] working directory -> {}", display_path));
+                    if session.process_child.is_some() {
+                        if let Some(child_arc) = session.process_child.take() {
+                            if let Ok(mut child) = child_arc.lock() {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                        }
+                        session.process_stdin = None;
+                        session.event_rx = None;
+                        session.state = claude::SessionState::Idle;
+                        session.output_lines.push("  [cd] session will resume in new directory on next prompt".into());
+                    }
+                    session.input_buf.clear();
+                    session.cursor_pos = 0;
+                    return EventOutcome::Consumed;
+                }
                 // Queue prompt if session is busy
                 if session.is_running() {
                     let prompt = session.input_buf.clone();
@@ -610,7 +847,7 @@ impl HypertilePlugin for ClaudePlugin {
 
                 // If no process is running, spawn one
                 if session.process_stdin.is_none() {
-                    match claude::spawn_session_process(&cli_session_id, is_resume, None) {
+                    match claude::spawn_session_process(&cli_session_id, is_resume, session.workdir.as_deref()) {
                         Ok((stdin, child, rx)) => {
                             session.process_stdin = Some(stdin);
                             session.process_child = Some(child);
@@ -642,6 +879,135 @@ impl HypertilePlugin for ClaudePlugin {
             }
             _ => EventOutcome::Ignored,
         }
+    }
+}
+
+// ── Slash command definitions ──
+
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/cd", "Change working directory"),
+    ("/clear", "Clear output"),
+    ("/kill", "Kill session process"),
+    ("/dangerously-skip-permissions", "Auto-skip all permissions"),
+];
+
+/// Returns the subset of SLASH_COMMANDS whose names start with `prefix`.
+fn filtered_slash_commands(prefix: &str) -> Vec<(&'static str, &'static str)> {
+    SLASH_COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .copied()
+        .collect()
+}
+
+/// Update slash popup visibility based on current input buffer.
+fn update_slash_popup(session: &mut claude::ClaudeSession) {
+    let trimmed = session.input_buf.trim_start();
+    if trimmed.starts_with('/') {
+        let prefix = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        let matches = filtered_slash_commands(prefix);
+        if !matches.is_empty() {
+            session.slash_popup_visible = true;
+            if session.slash_popup_selected >= matches.len() {
+                session.slash_popup_selected = 0;
+            }
+        } else {
+            session.slash_popup_visible = false;
+            session.slash_popup_selected = 0;
+        }
+    } else {
+        session.slash_popup_visible = false;
+        session.slash_popup_selected = 0;
+    }
+}
+
+fn render_slash_popup(buf: &mut Buffer, input_area: Rect, session: &claude::ClaudeSession) {
+    let prefix = session.input_buf.trim_start().split_whitespace().next().unwrap_or("");
+    let commands = filtered_slash_commands(prefix);
+    if commands.is_empty() {
+        return;
+    }
+
+    let popup_width = input_area.width.min(44).max(20);
+    let popup_height = (commands.len() as u16 + 2).min(input_area.y); // +2 for borders
+    if popup_height < 3 {
+        return;
+    }
+
+    let x = input_area.x;
+    let y = input_area.y.saturating_sub(popup_height);
+    let overlay = Rect::new(x, y, popup_width, popup_height);
+
+    let bg = theme::bg_secondary();
+    let border_color = theme::CYAN();
+
+    // Clear
+    for row in overlay.y..overlay.y + overlay.height {
+        for col in overlay.x..overlay.x + overlay.width {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.set_char(' ');
+                cell.set_bg(bg);
+                cell.set_fg(theme::text_primary());
+            }
+        }
+    }
+
+    let set_cell = |buf: &mut Buffer, x: u16, y: u16, ch: char, fg: ratatui::style::Color| {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_fg(fg);
+            cell.set_bg(bg);
+        }
+    };
+
+    let write_str = |buf: &mut Buffer, x: u16, y: u16, s: &str, fg: ratatui::style::Color, max_w: usize| {
+        for (i, ch) in s.chars().take(max_w).enumerate() {
+            set_cell(buf, x + i as u16, y, ch, fg);
+        }
+    };
+
+    // Top border
+    set_cell(buf, overlay.x, overlay.y, '┏', border_color);
+    set_cell(buf, overlay.x + overlay.width - 1, overlay.y, '┓', border_color);
+    for col in (overlay.x + 1)..(overlay.x + overlay.width - 1) {
+        set_cell(buf, col, overlay.y, '━', border_color);
+    }
+
+    // Bottom border
+    set_cell(buf, overlay.x, overlay.y + overlay.height - 1, '┗', border_color);
+    set_cell(buf, overlay.x + overlay.width - 1, overlay.y + overlay.height - 1, '┛', border_color);
+    for col in (overlay.x + 1)..(overlay.x + overlay.width - 1) {
+        set_cell(buf, col, overlay.y + overlay.height - 1, '━', border_color);
+    }
+
+    // Side borders
+    for row in (overlay.y + 1)..(overlay.y + overlay.height - 1) {
+        set_cell(buf, overlay.x, row, '┃', border_color);
+        set_cell(buf, overlay.x + overlay.width - 1, row, '┃', border_color);
+    }
+
+    let inner_x = overlay.x + 2;
+    let inner_w = overlay.width.saturating_sub(4) as usize;
+
+    for (i, (name, desc)) in commands.iter().enumerate() {
+        let row = overlay.y + 1 + i as u16;
+        if row >= overlay.y + overlay.height - 1 {
+            break;
+        }
+        let is_selected = i == session.slash_popup_selected;
+        // Highlight selected row background
+        if is_selected {
+            for col in (overlay.x + 1)..(overlay.x + overlay.width - 1) {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    cell.set_bg(theme::bg_primary());
+                }
+            }
+        }
+        let name_fg = if is_selected { theme::GREEN() } else { theme::CYAN() };
+        write_str(buf, inner_x, row, name, name_fg, inner_w);
+        let desc_start = inner_x + name.len() as u16 + 1;
+        let desc_w = inner_w.saturating_sub(name.len() + 1);
+        write_str(buf, desc_start, row, desc, theme::text_muted(), desc_w);
     }
 }
 
@@ -745,8 +1111,9 @@ fn render_permission_overlay(buf: &mut Buffer, area: Rect, req: &claude::Permiss
 
         // Hint at bottom
         let hint_row = overlay.y + overlay.height - 2;
-        write_str(buf, inner_x, hint_row, "Press 1-9 to choose  ", theme::text_muted(), inner_w);
-        write_str(buf, inner_x + 21, hint_row, "[Esc] dismiss", theme::RED(), inner_w.saturating_sub(21));
+        write_str(buf, inner_x, hint_row, "1-9:choose ", theme::text_muted(), inner_w);
+        write_str(buf, inner_x + 11, hint_row, "[o]other ", theme::CYAN(), inner_w.saturating_sub(11));
+        write_str(buf, inner_x + 20, hint_row, "[n/Esc]no", theme::RED(), inner_w.saturating_sub(20));
     } else {
         // Normal permission overlay: tool name + input preview + y/n
         let tool_line = format!("Tool: {}", req.tool_name);
@@ -2164,6 +2531,17 @@ fn run(
                             ));
                             continue; // Don't forward to workspace
                         }
+                    }
+                    // Intercept Escape before hypertile steals it from plugins
+                    // when a permission overlay is open. Hypertile unconditionally
+                    // consumes Escape in PluginInput mode to switch to Layout.
+                    if key.code == KeyCode::Esc
+                        && key.modifiers == KeyModifiers::NONE
+                        && workspace.active_runtime().mode() == InputMode::PluginInput
+                        && dismiss_any_awaiting_permission()
+                    {
+                        // Permission was dismissed, stay in PluginInput mode
+                        continue;
                     }
                     // 't' in layout mode opens theme selector
                     if key.code == KeyCode::Char('t')
