@@ -2,6 +2,9 @@
 
 A terminal UI for running multiple Claude Code sessions side-by-side in a tiled layout. Built with [ratatui](https://github.com/ratatui/ratatui) and [ratatui-hypertile](https://github.com/ratatui/ratatui-hypertile) for BSP tiling.
 
+<img width="1447" height="856" alt="image" src="https://github.com/user-attachments/assets/dba4a345-06a5-422e-9eca-fe99104ecae6" />
+
+
 ## Features
 
 - **Tiled Claude Sessions** — Split your terminal into multiple panes, each running an independent Claude CLI session with full streaming output
