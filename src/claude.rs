@@ -60,6 +60,17 @@ pub enum SessionState {
     AwaitingPermission(PermissionRequest),
 }
 
+impl SessionState {
+    /// Returns a short string label for the session state.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionState::Idle => "idle",
+            SessionState::Running => "running",
+            SessionState::AwaitingPermission(_) => "permission",
+        }
+    }
+}
+
 /// A single Claude CLI session running in a tile
 pub struct ClaudeSession {
     pub id: usize,
@@ -88,6 +99,8 @@ pub struct ClaudeSession {
     pub slash_popup_selected: usize,
     /// Auto-accept all permission requests (dangerously)
     pub auto_accept_permissions: bool,
+    /// Last computed visible output height (set during render, used for scroll clamping)
+    pub last_output_visible: u16,
 }
 
 impl ClaudeSession {
@@ -119,6 +132,7 @@ impl ClaudeSession {
             slash_popup_visible: false,
             slash_popup_selected: 0,
             auto_accept_permissions: false,
+            last_output_visible: 20,
         }
     }
 
@@ -236,6 +250,14 @@ impl ClaudeSession {
                 let _ = child.kill();
             }
         }
+    }
+
+    /// Transition from AwaitingPermission to Running and return a clone of stdin.
+    /// Used before sending a permission response.
+    pub fn begin_permission_response(&mut self) -> Option<Arc<Mutex<std::process::ChildStdin>>> {
+        self.state = SessionState::Running;
+        self.last_event_time = Some(Instant::now());
+        self.process_stdin.as_ref().map(Arc::clone)
     }
 
     /// Cancel a running request: go idle, keep process alive for next prompt.
@@ -386,6 +408,49 @@ impl ClaudeSession {
 
         got_any
     }
+}
+
+/// Send a prompt to a session: prepare state, spawn process if needed, send.
+/// The session must NOT be running (caller should queue if busy).
+/// The MutexGuard is dropped before writing to stdin; `session_arc` is used for error recovery.
+/// Returns an error string on failure, or None on success.
+pub fn prepare_and_send_prompt(
+    mut session: std::sync::MutexGuard<'_, ClaudeSession>,
+    session_arc: &Arc<Mutex<ClaudeSession>>,
+    prompt: &str,
+) -> Option<String> {
+    let cli_session_id = session.prepare_prompt(prompt);
+    let is_resume = session.prompt_count > 1;
+
+    // Spawn process if needed
+    if session.process_stdin.is_none() {
+        match spawn_session_process(&cli_session_id, is_resume, session.workdir.as_deref()) {
+            Ok((stdin, child, rx)) => {
+                session.process_stdin = Some(stdin);
+                session.process_child = Some(child);
+                session.event_rx = Some(rx);
+            }
+            Err(e) => {
+                session.output_lines.push(format!("  [error] {}", e));
+                session.state = SessionState::Idle;
+                return Some(e);
+            }
+        }
+    }
+
+    let stdin_arc = session.process_stdin.as_ref().map(Arc::clone);
+    let sess_id = session.session_id.clone();
+    drop(session);
+
+    if let Some(stdin) = stdin_arc {
+        if let Err(e) = send_prompt_to_process(&stdin, prompt, sess_id.as_deref()) {
+            let mut s = session_arc.lock().unwrap();
+            s.output_lines.push(format!("  [error] {}", e));
+            s.force_idle();
+            return Some(e);
+        }
+    }
+    None
 }
 
 // ── Streaming process management ──

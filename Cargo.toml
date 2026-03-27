@@ -15,3 +15,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 arboard = "3"
+unicode-width = "0.2"
+tokio = { version = "1", features = ["full"] }
+warp = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures = "0.3"
+rand = "0.9"

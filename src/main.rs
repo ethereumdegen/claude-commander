@@ -1,12 +1,14 @@
 mod claude;
 mod theme;
 mod usage;
+mod ws;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+use unicode_width::UnicodeWidthStr;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -40,6 +42,18 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             .map_err(|e| format!("clipboard set_text failed: {e}"))?;
     }
     Ok(())
+}
+
+/// Skip `cols` display columns from the start of `s`, returning the remaining substring.
+fn skip_display_cols(s: &str, cols: usize) -> &str {
+    let mut skipped = 0;
+    for (i, ch) in s.char_indices() {
+        if skipped >= cols {
+            return &s[i..];
+        }
+        skipped += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    ""
 }
 
 // ── Shared state for Claude sessions across panes ──
@@ -95,6 +109,21 @@ impl TextSelection {
     }
 }
 
+/// WebSocket operating mode
+#[derive(Clone, PartialEq)]
+pub enum WsMode {
+    Off,
+    Local { port: u16 },
+    Cloud { relay_url: String, room_id: String },
+}
+
+/// A connected WebSocket client
+#[derive(Clone)]
+pub struct WsClient {
+    pub addr: String,
+    pub connected_at: Instant,
+}
+
 struct SharedState {
     sessions: HashMap<usize, Arc<Mutex<claude::ClaudeSession>>>,
     next_id: usize,
@@ -103,6 +132,13 @@ struct SharedState {
     input_mode_active: bool,
     debug_log: Vec<(Instant, String)>,
     selection: TextSelection,
+    // WebSocket fields
+    ws_secret: String,
+    ws_mode: WsMode,
+    ws_connections: Vec<WsClient>,
+    ws_status: String,
+    ws_log: Vec<String>,
+    ws_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub fn debug_log(msg: impl Into<String>) {
@@ -118,10 +154,18 @@ pub fn debug_log(msg: impl Into<String>) {
 
 static SHARED: OnceLock<Mutex<SharedState>> = OnceLock::new();
 
+fn generate_secret_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let bytes: Vec<u8> = (0..16).map(|_| rng.random::<u8>()).collect();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn shared() -> &'static Mutex<SharedState> {
     SHARED.get_or_init(|| {
         let stats = usage::load_stats_cache();
         let live = usage::fetch_live_usage();
+        let secret = generate_secret_key();
         Mutex::new(SharedState {
             sessions: HashMap::new(),
             next_id: 1,
@@ -130,8 +174,43 @@ fn shared() -> &'static Mutex<SharedState> {
             input_mode_active: false,
             debug_log: vec![(Instant::now(), "Claude Commander started".into())],
             selection: TextSelection::default(),
+            ws_secret: secret,
+            ws_mode: WsMode::Off,
+            ws_connections: Vec::new(),
+            ws_status: "Off".into(),
+            ws_log: Vec::new(),
+            ws_shutdown: None,
         })
     })
+}
+
+/// Create a standard tile Block with focused/unfocused styling.
+fn make_tile_block(title: impl Into<String>, title_color: Color, is_focused: bool) -> Block<'static> {
+    let title = title.into();
+    if is_focused {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::THICK)
+            .border_style(
+                Style::default()
+                    .fg(theme::BORDER_FOCUSED())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title(title)
+            .title_style(
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(Style::default().bg(theme::bg_primary()))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+            .title(title)
+            .title_style(Style::default().fg(theme::text_secondary()))
+            .style(Style::default().bg(theme::bg_primary()))
+    }
 }
 
 /// Find any session that is awaiting permission and dismiss it.
@@ -172,10 +251,7 @@ fn dismiss_any_awaiting_permission() -> bool {
         "User denied this action"
     };
 
-    let stdin_arc = session.process_stdin.as_ref().map(Arc::clone);
-    if let Some(stdin) = stdin_arc {
-        session.state = claude::SessionState::Running;
-        session.last_event_time = Some(std::time::Instant::now());
+    if let Some(stdin) = session.begin_permission_response() {
         drop(session);
         if let Err(e) = claude::send_permission_response(
             &stdin, &request_id, false, None, Some(deny_message),
@@ -224,7 +300,7 @@ impl HypertilePlugin for ClaudePlugin {
             Paragraph::new("Session not found").render(area, buf);
             return;
         };
-        let session = session_arc.lock().unwrap();
+        let mut session = session_arc.lock().unwrap();
         let in_input_mode = is_focused && state.input_mode_active;
 
         let is_awaiting = session.is_awaiting_permission();
@@ -295,6 +371,8 @@ impl HypertilePlugin for ClaudePlugin {
         let show_rain = is_running && !is_awaiting;
         let rain_lines_count = if show_rain { 4 } else { 0 };
         let output_visible = visible_height.saturating_sub(rain_lines_count);
+        // Store for consistent scroll clamping in the input handler
+        session.last_output_visible = output_visible as u16;
 
         // Clamp scroll_offset to valid range
         let max_scroll = session.output_lines.len().saturating_sub(output_visible);
@@ -307,12 +385,29 @@ impl HypertilePlugin for ClaudePlugin {
             String::new()
         };
 
+        // Select lines from the bottom, accounting for line wrapping.
+        // Each logical line may wrap to multiple visual rows, so we can't
+        // just .take(output_visible) logical lines — that would overshoot
+        // and the Paragraph widget would clip the bottom.
+        let wrap_width = output_area.width.max(1) as usize;
+        let mut visual_rows_used = 0usize;
+        let mut lines_to_take = 0usize;
+        for l in session.output_lines.iter().rev().skip(scroll) {
+            let line_width = UnicodeWidthStr::width(l.as_str());
+            let rows = if line_width == 0 { 1 } else { (line_width + wrap_width - 1) / wrap_width };
+            if visual_rows_used + rows > output_visible && lines_to_take > 0 {
+                break;
+            }
+            visual_rows_used += rows;
+            lines_to_take += 1;
+        }
+
         let mut lines: Vec<Line> = session
             .output_lines
             .iter()
             .rev()
             .skip(scroll)
-            .take(output_visible)
+            .take(lines_to_take)
             .rev()
             .map(|l| {
                 let style = if l.starts_with("▸") {
@@ -414,15 +509,29 @@ impl HypertilePlugin for ClaudePlugin {
             let after = &session.input_buf[pos..];
             let cursor_ch = if cursor_visible { "█" } else { " " };
 
+            // Horizontal scroll: keep cursor visible within input width
+            let w = input_inner.width as usize;
+            let cursor_col = UnicodeWidthStr::width(before);
+            let scroll = if cursor_col >= w { cursor_col - w + 1 } else { 0 };
+
+            // Skip `scroll` display columns from the start of `before`
+            let visible_before = skip_display_cols(before, scroll);
+
             Paragraph::new(Line::from(vec![
-                Span::styled(before, Style::default().fg(theme::text_primary())),
+                Span::styled(visible_before, Style::default().fg(theme::text_primary())),
                 Span::styled(cursor_ch, Style::default().fg(theme::GREEN())),
                 Span::styled(after, Style::default().fg(theme::text_primary())),
             ]))
             .style(Style::default().bg(theme::bg_secondary()))
             .render(input_inner, buf);
         } else {
-            Paragraph::new(&*session.input_buf)
+            // Unfocused: show the end of the text if it overflows
+            let w = input_inner.width as usize;
+            let text_width = UnicodeWidthStr::width(session.input_buf.as_str());
+            let scroll = if text_width > w { text_width - w } else { 0 };
+            let visible = skip_display_cols(&session.input_buf, scroll);
+
+            Paragraph::new(visible)
                 .style(
                     Style::default()
                         .fg(theme::text_primary())
@@ -573,10 +682,7 @@ impl HypertilePlugin for ClaudePlugin {
 
             // Now send the response with the session lock properly released
             if let Some((request_id, allow, updated_input, deny_message)) = response_action {
-                let stdin_arc = session.process_stdin.as_ref().map(Arc::clone);
-                if let Some(stdin) = stdin_arc {
-                    session.state = claude::SessionState::Running;
-                    session.last_event_time = Some(std::time::Instant::now());
+                if let Some(stdin) = session.begin_permission_response() {
                     let sid = self.session_id;
                     // CRITICAL: drop the MutexGuard before writing to stdin
                     drop(session);
@@ -642,7 +748,8 @@ impl HypertilePlugin for ClaudePlugin {
         match key.code {
             HtKeyCode::PageUp | HtKeyCode::Up => {
                 let step = if matches!(key.code, HtKeyCode::PageUp) { 10 } else { 3 };
-                let max_scroll = session.output_lines.len().saturating_sub(1);
+                let max_scroll = session.output_lines.len()
+                    .saturating_sub(session.last_output_visible as usize);
                 session.scroll_offset = (session.scroll_offset + step).min(max_scroll as u16);
                 return EventOutcome::Consumed;
             }
@@ -784,6 +891,9 @@ impl HypertilePlugin for ClaudePlugin {
                         } else {
                             raw_path.clone()
                         }
+                    } else if std::path::Path::new(&raw_path).is_relative() {
+                        let base = session.effective_cwd();
+                        format!("{}/{}", base, raw_path)
                     } else {
                         raw_path.clone()
                     };
@@ -824,6 +934,40 @@ impl HypertilePlugin for ClaudePlugin {
                     session.cursor_pos = 0;
                     return EventOutcome::Consumed;
                 }
+
+                // Handle /resume command to resume an existing Claude session
+                if trimmed == "/resume" || trimmed.starts_with("/resume ") {
+                    let resume_id = if trimmed == "/resume" {
+                        String::new()
+                    } else {
+                        trimmed[8..].trim().to_string()
+                    };
+                    if resume_id.is_empty() {
+                        session.output_lines.push("  [resume] usage: /resume <session-id>".into());
+                        session.input_buf.clear();
+                        session.cursor_pos = 0;
+                        return EventOutcome::Consumed;
+                    }
+                    // Kill existing process if any
+                    if let Some(child_arc) = session.process_child.take() {
+                        if let Ok(mut child) = child_arc.lock() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                    session.process_stdin = None;
+                    session.event_rx = None;
+                    session.state = claude::SessionState::Idle;
+                    // Set session_id and prompt_count so next spawn uses --resume
+                    session.session_id = Some(resume_id.clone());
+                    session.prompt_count = 1; // ensures is_resume=true on next prompt
+                    session.output_lines.push(format!("  [resume] session set to {}", resume_id));
+                    session.output_lines.push("  [resume] type your next prompt to resume the conversation".into());
+                    session.input_buf.clear();
+                    session.cursor_pos = 0;
+                    return EventOutcome::Consumed;
+                }
+
                 // Queue prompt if session is busy
                 if session.is_running() {
                     let prompt = session.input_buf.clone();
@@ -839,42 +983,11 @@ impl HypertilePlugin for ClaudePlugin {
                 let prompt = session.input_buf.clone();
                 session.input_buf.clear();
                 session.cursor_pos = 0;
-                let cli_session_id = session.prepare_prompt(&prompt);
-                let is_resume = session.prompt_count > 1;
 
                 let plugin_sid = self.session_id;
                 debug_log(format!("[session {}] Sending prompt: {}", plugin_sid, claude::truncate_chars(&prompt, 80)));
 
-                // If no process is running, spawn one
-                if session.process_stdin.is_none() {
-                    match claude::spawn_session_process(&cli_session_id, is_resume, session.workdir.as_deref()) {
-                        Ok((stdin, child, rx)) => {
-                            session.process_stdin = Some(stdin);
-                            session.process_child = Some(child);
-                            session.event_rx = Some(rx);
-                            debug_log(format!("[session {}] Spawned streaming process", plugin_sid));
-                        }
-                        Err(e) => {
-                            session.output_lines.push(format!("  [error] {}", e));
-                            session.state = claude::SessionState::Idle;
-                            return EventOutcome::Consumed;
-                        }
-                    }
-                }
-
-                // Send prompt to existing process
-                let stdin_arc = session.process_stdin.as_ref().map(Arc::clone);
-                let sess_id = session.session_id.clone();
-                drop(session);
-
-                if let Some(stdin) = stdin_arc {
-                    if let Err(e) = claude::send_prompt_to_process(&stdin, &prompt, sess_id.as_deref()) {
-                        debug_log(format!("[session {}] Send error: {}", plugin_sid, e));
-                        let mut s = session_arc.lock().unwrap();
-                        s.output_lines.push(format!("  [error] {}", e));
-                        s.force_idle();
-                    }
-                }
+                claude::prepare_and_send_prompt(session, &session_arc, &prompt);
                 EventOutcome::Consumed
             }
             _ => EventOutcome::Ignored,
@@ -885,9 +998,11 @@ impl HypertilePlugin for ClaudePlugin {
 // ── Slash command definitions ──
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/btw", "Send /btw to Claude session"),
     ("/cd", "Change working directory"),
     ("/clear", "Clear output"),
     ("/kill", "Kill session process"),
+    ("/resume", "Resume a Claude session by ID"),
     ("/dangerously-skip-permissions", "Auto-skip all permissions"),
 ];
 
@@ -905,6 +1020,13 @@ fn update_slash_popup(session: &mut claude::ClaudeSession) {
     let trimmed = session.input_buf.trim_start();
     if trimmed.starts_with('/') {
         let prefix = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        // Hide popup once the user is typing arguments after a complete command
+        let is_exact_match = SLASH_COMMANDS.iter().any(|(name, _)| *name == prefix);
+        if is_exact_match {
+            session.slash_popup_visible = false;
+            session.slash_popup_selected = 0;
+            return;
+        }
         let matches = filtered_slash_commands(prefix);
         if !matches.is_empty() {
             session.slash_popup_visible = true;
@@ -1158,37 +1280,7 @@ impl HypertilePlugin for UsagePlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
         let state = shared().lock().unwrap();
 
-        let border_color = if is_focused {
-            theme::BORDER_FOCUSED()
-        } else {
-            theme::BORDER_NORMAL()
-        };
-
-        let block = if is_focused {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_set(border::THICK)
-                .border_style(
-                    Style::default()
-                        .fg(border_color)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .title("  Token Usage Dashboard  ")
-                .title_style(
-                    Style::default()
-                        .fg(theme::CYAN())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .style(Style::default().bg(theme::bg_primary()))
-        } else {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title("  Token Usage Dashboard  ")
-                .title_style(Style::default().fg(theme::text_secondary()))
-                .style(Style::default().bg(theme::bg_primary()))
-        };
-
+        let block = make_tile_block("  Token Usage Dashboard  ", theme::CYAN(), is_focused);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -1540,12 +1632,6 @@ impl HypertilePlugin for DebugPlugin {
         let state = shared().lock().unwrap();
         let start = Instant::now();
 
-        let border_color = if is_focused {
-            theme::BORDER_FOCUSED()
-        } else {
-            theme::BORDER_NORMAL()
-        };
-
         let filtered = self.filtered_indices(&state.debug_log);
         let total = state.debug_log.len();
         let shown = filtered.len();
@@ -1561,31 +1647,7 @@ impl HypertilePlugin for DebugPlugin {
             title_parts.push_str("[nowrap] ");
         }
 
-        let block = if is_focused {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_set(border::THICK)
-                .border_style(
-                    Style::default()
-                        .fg(border_color)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .title(title_parts)
-                .title_style(
-                    Style::default()
-                        .fg(theme::ORANGE())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .style(Style::default().bg(theme::bg_primary()))
-        } else {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(title_parts)
-                .title_style(Style::default().fg(theme::text_secondary()))
-                .style(Style::default().bg(theme::bg_primary()))
-        };
-
+        let block = make_tile_block(title_parts, theme::ORANGE(), is_focused);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -1939,38 +2001,8 @@ impl HypertilePlugin for SessionListPlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
         let state = shared().lock().unwrap();
 
-        let border_color = if is_focused {
-            theme::BORDER_FOCUSED()
-        } else {
-            theme::BORDER_NORMAL()
-        };
-
         let title = format!("  Sessions ({})  ", state.sessions.len());
-        let block = if is_focused {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_set(border::THICK)
-                .border_style(
-                    Style::default()
-                        .fg(border_color)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .title(title)
-                .title_style(
-                    Style::default()
-                        .fg(theme::MAGENTA())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .style(Style::default().bg(theme::bg_primary()))
-        } else {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(title)
-                .title_style(Style::default().fg(theme::text_secondary()))
-                .style(Style::default().bg(theme::bg_primary()))
-        };
-
+        let block = make_tile_block(title, theme::MAGENTA(), is_focused);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -2147,34 +2179,8 @@ impl HypertilePlugin for ThemeMenuPlugin {
         let themes = theme::all_themes();
         let current = theme::active_index();
 
-        let border_color = if is_focused { t.border_focused } else { t.border_normal };
-
         let title = format!("  Themes ({})  ", themes.len());
-        let block = if is_focused {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_set(border::THICK)
-                .border_style(
-                    Style::default()
-                        .fg(border_color)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .title(title)
-                .title_style(
-                    Style::default()
-                        .fg(t.magenta)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .style(Style::default().bg(t.bg_primary))
-        } else {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(title)
-                .title_style(Style::default().fg(t.text_secondary))
-                .style(Style::default().bg(t.bg_primary))
-        };
-
+        let block = make_tile_block(title, t.magenta, is_focused);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -2298,6 +2304,365 @@ impl HypertilePlugin for ThemeMenuPlugin {
     }
 }
 
+// ── WebSocket Panel Plugin ──
+
+struct WebSocketPlugin {
+    log_scroll: usize,
+    /// When something was copied: (timestamp, label like "Key" or "URL")
+    copy_flash: Option<(Instant, String)>,
+    /// Animation tick counter for the flash effect
+    flash_tick: u64,
+}
+
+impl WebSocketPlugin {
+    fn new() -> Self {
+        debug_log("[ws] WebSocket panel opened");
+        Self {
+            log_scroll: 0,
+            copy_flash: None,
+            flash_tick: 0,
+        }
+    }
+
+    /// Whether the copy flash is still active (within 2 seconds)
+    fn flash_active(&self) -> bool {
+        self.copy_flash
+            .as_ref()
+            .is_some_and(|(t, _)| t.elapsed().as_millis() < 2000)
+    }
+
+    /// Get the flash progress (0.0 = just copied, 1.0 = faded out)
+    fn flash_progress(&self) -> f64 {
+        self.copy_flash
+            .as_ref()
+            .map(|(t, _)| t.elapsed().as_millis() as f64 / 2000.0)
+            .unwrap_or(1.0)
+            .min(1.0)
+    }
+}
+
+impl HypertilePlugin for WebSocketPlugin {
+    fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
+        let state = shared().lock().unwrap();
+
+        let title = format!("  WebSocket [{}]  ", state.ws_status);
+        let block = make_tile_block(title, theme::CYAN(), is_focused);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // mode selector
+                Constraint::Length(2), // connection info
+                Constraint::Length(2), // secret key
+                Constraint::Length(3), // clients
+                Constraint::Min(3),   // connection log
+                Constraint::Length(1), // help bar
+            ])
+            .split(inner);
+
+        // Mode selector
+        let (local_style, cloud_style, off_style) = match &state.ws_mode {
+            WsMode::Local { .. } => (
+                Style::default().fg(theme::bg_primary()).bg(theme::GREEN()).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::text_muted()),
+                Style::default().fg(theme::text_muted()),
+            ),
+            WsMode::Cloud { .. } => (
+                Style::default().fg(theme::text_muted()),
+                Style::default().fg(theme::bg_primary()).bg(theme::CYAN()).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::text_muted()),
+            ),
+            WsMode::Off => (
+                Style::default().fg(theme::text_muted()),
+                Style::default().fg(theme::text_muted()),
+                Style::default().fg(theme::bg_primary()).bg(theme::RED()).add_modifier(Modifier::BOLD),
+            ),
+        };
+
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Mode: ", Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD)),
+            Span::styled(" [1] Local ", local_style),
+            Span::raw("  "),
+            Span::styled(" [2] Cloud ", cloud_style),
+            Span::raw("  "),
+            Span::styled(" [3] Off ", off_style),
+        ]))
+        .style(Style::default().bg(theme::bg_primary()))
+        .render(chunks[0], buf);
+
+        // Connection info
+        let info_line = match &state.ws_mode {
+            WsMode::Local { port } => {
+                format!("  Listening on ws://0.0.0.0:{}", port)
+            }
+            WsMode::Cloud { relay_url, room_id } => {
+                format!("  Relay: {} | Room: {}", relay_url, room_id)
+            }
+            WsMode::Off => "  WebSocket server is off".into(),
+        };
+        let info_color = match &state.ws_mode {
+            WsMode::Off => theme::text_muted(),
+            _ => theme::GREEN(),
+        };
+        Paragraph::new(Line::from(Span::styled(info_line, Style::default().fg(info_color))))
+            .style(Style::default().bg(theme::bg_primary()))
+            .render(chunks[1], buf);
+
+        // Secret key + copy flash
+        let key_display = if state.ws_secret.len() > 16 {
+            format!("{}...", &state.ws_secret[..16])
+        } else {
+            state.ws_secret.clone()
+        };
+
+        // Secret key row — with copy flash animation
+        if self.flash_active() {
+            let progress = self.flash_progress();
+            let label = self.copy_flash.as_ref().map(|(_, l)| l.as_str()).unwrap_or("?");
+            let tick = self.flash_tick as usize;
+
+            // Braille spinner frames
+            let spinner = [">>>", ">>>", ">> ", ">  ", "   ", "  <", " <<", "<<<", "<<<"];
+            let frame = spinner[tick % spinner.len()];
+
+            // Color pulses between green and cyan
+            let fg = if tick % 2 == 0 { theme::GREEN() } else { theme::CYAN() };
+
+            if progress < 0.5 {
+                // Phase 1: Bright inverted banner
+                let bar_len = ((1.0 - progress * 2.0) * 12.0) as usize;
+                let bar: String = "=".repeat(bar_len);
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!("  {} COPIED {} {} ", frame, label, frame),
+                        Style::default().fg(theme::bg_primary()).bg(fg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        bar,
+                        Style::default().fg(fg),
+                    ),
+                ]))
+                .style(Style::default().bg(theme::bg_primary()))
+                .render(chunks[2], buf);
+            } else {
+                // Phase 2: Fade to key display with "copied" badge
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  Key: ", Style::default().fg(theme::text_secondary())),
+                    Span::styled(
+                        &key_display,
+                        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  [{}] copied", label),
+                        Style::default().fg(theme::GREEN()),
+                    ),
+                ]))
+                .style(Style::default().bg(theme::bg_primary()))
+                .render(chunks[2], buf);
+            }
+        } else {
+            Paragraph::new(Line::from(vec![
+                Span::styled("  Key: ", Style::default().fg(theme::text_secondary())),
+                Span::styled(&key_display, Style::default().fg(theme::ORANGE()).add_modifier(Modifier::BOLD)),
+                Span::styled("  (c:copy key, u:copy URL)", Style::default().fg(theme::text_muted())),
+            ]))
+            .style(Style::default().bg(theme::bg_primary()))
+            .render(chunks[2], buf);
+        }
+
+        // Connected clients
+        let client_count = state.ws_connections.len();
+        let mut client_lines = vec![
+            Line::from(Span::styled(
+                format!("  Clients: {}", client_count),
+                Style::default().fg(theme::text_primary()).add_modifier(Modifier::BOLD),
+            )),
+        ];
+        for client in state.ws_connections.iter().take(3) {
+            let elapsed = client.connected_at.elapsed().as_secs();
+            client_lines.push(Line::from(Span::styled(
+                format!("    {} ({}s ago)", client.addr, elapsed),
+                Style::default().fg(theme::CYAN()),
+            )));
+        }
+        Paragraph::new(client_lines)
+            .style(Style::default().bg(theme::bg_primary()))
+            .render(chunks[3], buf);
+
+        // Connection log
+        let log_height = chunks[4].height.saturating_sub(1) as usize;
+        let log_entries: Vec<Line> = state
+            .ws_log
+            .iter()
+            .rev()
+            .skip(self.log_scroll)
+            .take(log_height)
+            .rev()
+            .map(|entry| {
+                let color = if entry.contains("error") || entry.contains("failed") {
+                    theme::RED()
+                } else if entry.contains("onnect") {
+                    theme::GREEN()
+                } else {
+                    theme::text_secondary()
+                };
+                Line::from(Span::styled(format!("  {}", entry), Style::default().fg(color)))
+            })
+            .collect();
+        Paragraph::new(log_entries)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                    .title(" Log ")
+                    .title_style(Style::default().fg(theme::text_muted())),
+            )
+            .style(Style::default().bg(theme::bg_primary()))
+            .render(chunks[4], buf);
+
+        // Help bar
+        if is_focused {
+            Paragraph::new(Line::from(vec![
+                Span::styled(" 1", Style::default().fg(theme::GREEN()).add_modifier(Modifier::BOLD)),
+                Span::styled(":local ", Style::default().fg(theme::text_muted())),
+                Span::styled("2", Style::default().fg(theme::CYAN()).add_modifier(Modifier::BOLD)),
+                Span::styled(":cloud ", Style::default().fg(theme::text_muted())),
+                Span::styled("3", Style::default().fg(theme::RED()).add_modifier(Modifier::BOLD)),
+                Span::styled(":off ", Style::default().fg(theme::text_muted())),
+                Span::styled("c", Style::default().fg(theme::ORANGE()).add_modifier(Modifier::BOLD)),
+                Span::styled(":key ", Style::default().fg(theme::text_muted())),
+                Span::styled("u", Style::default().fg(theme::ORANGE()).add_modifier(Modifier::BOLD)),
+                Span::styled(":URL ", Style::default().fg(theme::text_muted())),
+                Span::styled("j/k", Style::default().fg(theme::YELLOW()).add_modifier(Modifier::BOLD)),
+                Span::styled(":scroll", Style::default().fg(theme::text_muted())),
+            ]))
+            .style(Style::default().bg(theme::bg_secondary()))
+            .render(chunks[5], buf);
+        }
+    }
+
+    fn on_event(&mut self, event: &HypertileEvent) -> EventOutcome {
+        // Tick: advance flash animation
+        if matches!(event, HypertileEvent::Tick) {
+            if self.flash_active() {
+                self.flash_tick += 1;
+                return EventOutcome::Consumed;
+            }
+            return EventOutcome::Ignored;
+        }
+
+        let HypertileEvent::Key(key) = event else {
+            return EventOutcome::Ignored;
+        };
+
+        match key.code {
+            HtKeyCode::Char('1') => {
+                // Switch to Local mode
+                let mut state = shared().lock().unwrap();
+                if matches!(state.ws_mode, WsMode::Local { .. }) {
+                    return EventOutcome::Consumed;
+                }
+                // Shut down existing
+                let _ = state.ws_shutdown.take();
+                let port = 9753u16;
+                let secret = state.ws_secret.clone();
+                state.ws_mode = WsMode::Local { port };
+                state.ws_status = "Starting...".into();
+                state.ws_connections.clear();
+                drop(state);
+
+                let shutdown = ws::start_local_server(port, secret);
+                let mut state = shared().lock().unwrap();
+                state.ws_shutdown = Some(shutdown);
+                EventOutcome::Consumed
+            }
+            HtKeyCode::Char('2') => {
+                // Switch to Cloud mode
+                let mut state = shared().lock().unwrap();
+                if matches!(state.ws_mode, WsMode::Cloud { .. }) {
+                    return EventOutcome::Consumed;
+                }
+                let _ = state.ws_shutdown.take();
+                let secret = state.ws_secret.clone();
+                let room_id = secret[..12].to_string();
+                let relay_url = "wss://relay.example.com".to_string();
+                state.ws_mode = WsMode::Cloud {
+                    relay_url: relay_url.clone(),
+                    room_id: room_id.clone(),
+                };
+                state.ws_status = "Connecting...".into();
+                state.ws_connections.clear();
+                drop(state);
+
+                let shutdown = ws::start_cloud_client(relay_url, room_id, secret);
+                let mut state = shared().lock().unwrap();
+                state.ws_shutdown = Some(shutdown);
+                EventOutcome::Consumed
+            }
+            HtKeyCode::Char('3') => {
+                // Switch to Off
+                let mut state = shared().lock().unwrap();
+                let _ = state.ws_shutdown.take();
+                state.ws_mode = WsMode::Off;
+                state.ws_status = "Off".into();
+                state.ws_connections.clear();
+                EventOutcome::Consumed
+            }
+            HtKeyCode::Char('c') => {
+                // Copy secret key
+                let state = shared().lock().unwrap();
+                let key = state.ws_secret.clone();
+                drop(state);
+                match copy_to_clipboard(&key) {
+                    Ok(_) => {
+                        debug_log("[ws] Secret key copied to clipboard");
+                        self.copy_flash = Some((Instant::now(), "Key".into()));
+                        self.flash_tick = 0;
+                    }
+                    Err(e) => debug_log(format!("[ws] clipboard copy failed: {}", e)),
+                }
+                EventOutcome::Consumed
+            }
+            HtKeyCode::Char('u') => {
+                // Copy connection URL
+                let state = shared().lock().unwrap();
+                let url = match &state.ws_mode {
+                    WsMode::Local { port } => {
+                        format!("ws://127.0.0.1:{}/ws?key={}", port, state.ws_secret)
+                    }
+                    WsMode::Cloud { relay_url, room_id } => {
+                        format!("{}/join?room={}&key={}", relay_url, room_id, state.ws_secret)
+                    }
+                    WsMode::Off => "WebSocket is off".into(),
+                };
+                drop(state);
+                match copy_to_clipboard(&url) {
+                    Ok(_) => {
+                        debug_log(format!("[ws] URL copied: {}", claude::truncate_chars(&url, 60)));
+                        self.copy_flash = Some((Instant::now(), "URL".into()));
+                        self.flash_tick = 0;
+                    }
+                    Err(e) => debug_log(format!("[ws] clipboard copy failed: {}", e)),
+                }
+                EventOutcome::Consumed
+            }
+            HtKeyCode::Char('j') => {
+                if self.log_scroll > 0 {
+                    self.log_scroll -= 1;
+                }
+                EventOutcome::Consumed
+            }
+            HtKeyCode::Char('k') => {
+                self.log_scroll += 1;
+                EventOutcome::Consumed
+            }
+            _ => EventOutcome::Ignored,
+        }
+    }
+}
+
 // ── Main ──
 
 fn build_runtime() -> HypertileRuntime {
@@ -2315,6 +2680,7 @@ fn build_runtime() -> HypertileRuntime {
     rt.register_plugin_type("debug", DebugPlugin::new);
     rt.register_plugin_type("sessions", SessionListPlugin::new);
     rt.register_plugin_type("themes", ThemeMenuPlugin::new);
+    rt.register_plugin_type("websocket", WebSocketPlugin::new);
 
     rt
 }
