@@ -61,14 +61,22 @@ pub struct ModelUsage {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct LiveUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bucket")]
     pub five_hour: UsageBucket,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bucket")]
     pub seven_day: UsageBucket,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bucket")]
     pub seven_day_sonnet: UsageBucket,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bucket")]
     pub seven_day_opus: UsageBucket,
+}
+
+/// Deserialize a UsageBucket that may be null in the API response.
+fn deserialize_bucket<'de, D>(deserializer: D) -> Result<UsageBucket, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<UsageBucket>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -195,9 +203,11 @@ fn render_utilization(f: &mut Frame, area: Rect, live: &LiveUsage) {
     ];
 
     for (i, (label, bucket)) in buckets.iter().enumerate() {
-        let pct = (bucket.utilization * 100.0).min(100.0);
-        let color = theme::utilization_color(bucket.utilization);
-        let filled = ((cols[i].width.saturating_sub(2)) as f64 * bucket.utilization) as u16;
+        // API returns utilization as a percentage (0–100), not a fraction
+        let pct = bucket.utilization.min(100.0);
+        let frac = pct / 100.0;
+        let color = theme::utilization_color(frac);
+        let filled = ((cols[i].width.saturating_sub(2)) as f64 * frac) as u16;
 
         let bar_line = format!(
             "{} {:>5.1}%",

@@ -1241,10 +1241,12 @@ fn render_utilization_buf(buf: &mut Buffer, area: Rect, live: &LiveUsage) {
     ];
 
     for (i, (label, bucket)) in buckets.iter().enumerate() {
-        let pct = (bucket.utilization * 100.0).min(100.0);
-        let color = theme::utilization_color(bucket.utilization);
+        // API returns utilization as a percentage (0–100), not a fraction
+        let pct = bucket.utilization.min(100.0);
+        let frac = pct / 100.0;
+        let color = theme::utilization_color(frac);
         let bar_width = cols[i].width.saturating_sub(4) as usize;
-        let filled = (bar_width as f64 * bucket.utilization).min(bar_width as f64) as usize;
+        let filled = (bar_width as f64 * frac).min(bar_width as f64) as usize;
 
         let bar_str = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
 
