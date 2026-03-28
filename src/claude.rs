@@ -392,6 +392,13 @@ impl ClaudeSession {
             }
         }
 
+        // Cap output_lines to prevent unbounded memory growth over long sessions
+        const MAX_OUTPUT_LINES: usize = 10_000;
+        if self.output_lines.len() > MAX_OUTPUT_LINES {
+            let trim = self.output_lines.len() - MAX_OUTPUT_LINES;
+            self.output_lines.drain(..trim);
+        }
+
         // Watchdog: if Running with no events for 2 minutes, assume stuck
         if matches!(self.state, SessionState::Running) {
             if let Some(last) = self.last_event_time {

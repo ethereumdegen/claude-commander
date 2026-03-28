@@ -4,8 +4,19 @@ mod usage;
 mod ws;
 
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// File-based trace log for diagnosing freezes (works even when TUI is stuck).
+/// Writes to /tmp/claude-commander-trace.log
+fn trace_log(msg: &str) {
+    use std::fs::OpenOptions;
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("/tmp/claude-commander-trace.log") {
+        let _ = writeln!(f, "[{:?}] {}", Instant::now(), msg);
+    }
+}
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
 use unicode_width::UnicodeWidthStr;
@@ -25,24 +36,25 @@ use crate::usage::{LiveUsage, StatsCache};
 
 /// Copy text to the system clipboard, using platform-specific persistence on Linux.
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard init failed: {e}"))?;
-    #[cfg(target_os = "linux")]
-    {
-        use arboard::SetExtLinux;
-        clipboard
-            .set()
-            .wait()
-            .text(text.to_owned())
-            .map_err(|e| format!("clipboard set_text failed: {e}"))?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        clipboard
-            .set_text(text.to_owned())
-            .map_err(|e| format!("clipboard set_text failed: {e}"))?;
-    }
+    // Run clipboard ops in a background thread to avoid blocking the TUI.
+    // On Linux, arboard's .wait() blocks indefinitely until another app
+    // reads the clipboard, which freezes the entire event loop.
+    let text = text.to_owned();
+    std::thread::spawn(move || {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+        #[cfg(target_os = "linux")]
+        {
+            use arboard::SetExtLinux;
+            let _ = clipboard.set().wait().text(text);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = clipboard.set_text(text);
+        }
+    });
     Ok(())
 }
+
 
 /// Skip `cols` display columns from the start of `s`, returning the remaining substring.
 fn skip_display_cols(s: &str, cols: usize) -> &str {
@@ -125,11 +137,8 @@ pub struct WsClient {
 }
 
 struct SharedState {
-    sessions: HashMap<usize, Arc<Mutex<claude::ClaudeSession>>>,
-    next_id: usize,
     usage_stats: StatsCache,
     usage_live: LiveUsage,
-    input_mode_active: bool,
     debug_log: Vec<(Instant, String)>,
     selection: TextSelection,
     // WebSocket fields
@@ -153,6 +162,16 @@ pub fn debug_log(msg: impl Into<String>) {
 }
 
 static SHARED: OnceLock<Mutex<SharedState>> = OnceLock::new();
+static INPUT_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Atomic quit flag — set by Ctrl+C, checked at the top of the event loop
+/// so the app exits even if a render frame was blocked on a mutex.
+static QUIT: AtomicBool = AtomicBool::new(false);
+static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
+static SESSIONS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<claude::ClaudeSession>>>>> = OnceLock::new();
+
+pub fn sessions() -> &'static Mutex<HashMap<usize, Arc<Mutex<claude::ClaudeSession>>>> {
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn generate_secret_key() -> String {
     use rand::Rng;
@@ -167,11 +186,8 @@ fn shared() -> &'static Mutex<SharedState> {
         let live = usage::fetch_live_usage();
         let secret = generate_secret_key();
         Mutex::new(SharedState {
-            sessions: HashMap::new(),
-            next_id: 1,
             usage_stats: stats,
             usage_live: live,
-            input_mode_active: false,
             debug_log: vec![(Instant::now(), "Claude Commander started".into())],
             selection: TextSelection::default(),
             ws_secret: secret,
@@ -216,26 +232,26 @@ fn make_tile_block(title: impl Into<String>, title_color: Color, is_focused: boo
 /// Find any session that is awaiting permission and dismiss it.
 /// Returns true if a permission was dismissed (caller should skip hypertile).
 fn dismiss_any_awaiting_permission() -> bool {
-    let state = shared().lock().unwrap();
-    // Find a session that is awaiting permission
-    let awaiting: Option<(usize, Arc<Mutex<claude::ClaudeSession>>)> = state
-        .sessions
-        .iter()
-        .find_map(|(&id, arc)| {
-            let s = arc.lock().unwrap();
-            if s.is_awaiting_permission() {
-                Some((id, Arc::clone(arc)))
-            } else {
-                None
-            }
-        });
-    drop(state);
+    // Collect arcs first, then drop the sessions lock before locking individual sessions
+    let arcs: Vec<(usize, Arc<Mutex<claude::ClaudeSession>>)> = {
+        let Ok(sessions) = sessions().try_lock() else { return false };
+        sessions.iter().map(|(&id, arc)| (id, Arc::clone(arc))).collect()
+    };
+    // Now iterate WITHOUT holding sessions lock
+    let awaiting = arcs.iter().find_map(|(id, arc)| {
+        let Ok(s) = arc.try_lock() else { return None };
+        if s.is_awaiting_permission() {
+            Some((*id, Arc::clone(arc)))
+        } else {
+            None
+        }
+    });
 
     let Some((sid, session_arc)) = awaiting else {
         return false;
     };
 
-    let mut session = session_arc.lock().unwrap();
+    let Ok(mut session) = session_arc.try_lock() else { return false };
     let (request_id, is_question) = match &session.state {
         claude::SessionState::AwaitingPermission(req) => {
             (req.request_id.clone(), !req.questions.is_empty())
@@ -257,9 +273,10 @@ fn dismiss_any_awaiting_permission() -> bool {
             &stdin, &request_id, false, None, Some(deny_message),
         ) {
             debug_log(format!("[session {}] Send error: {}", sid, e));
-            let mut s = session_arc.lock().unwrap();
-            s.force_idle();
-            s.output_lines.push(format!("  [error] {}", e));
+            if let Ok(mut s) = session_arc.try_lock() {
+                s.force_idle();
+                s.output_lines.push(format!("  [error] {}", e));
+            }
         }
     } else {
         session.force_idle();
@@ -269,14 +286,10 @@ fn dismiss_any_awaiting_permission() -> bool {
 }
 
 fn create_session() -> usize {
-    let mut state = shared().lock().unwrap();
-    let id = state.next_id;
-    state.next_id += 1;
+    let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let session = claude::ClaudeSession::new(id);
-    state
-        .sessions
-        .insert(id, Arc::new(Mutex::new(session)));
-    state.debug_log.push((Instant::now(), format!("[session] Created session {}", id)));
+    sessions().lock().unwrap().insert(id, Arc::new(Mutex::new(session)));
+    debug_log(format!("[session] Created session {}", id));
     id
 }
 
@@ -295,13 +308,39 @@ impl ClaudePlugin {
 
 impl HypertilePlugin for ClaudePlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
-        let state = shared().lock().unwrap();
-        let Some(session_arc) = state.sessions.get(&self.session_id) else {
-            Paragraph::new("Session not found").render(area, buf);
+        // Extract what we need from shared state, then drop the lock BEFORE
+        // locking the session — holding both simultaneously causes deadlocks
+        // with WS/other threads that lock in the opposite order.
+        let session_arc = {
+            let Ok(sess) = sessions().try_lock() else {
+                // sessions map locked — show placeholder, skip this frame
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                    .title(format!(" Session {} │ ⟳ ", self.session_id))
+                    .style(Style::default().bg(theme::bg_primary()))
+                    .render(area, buf);
+                return;
+            };
+            let Some(arc) = sess.get(&self.session_id) else {
+                Paragraph::new("Session not found").render(area, buf);
+                return;
+            };
+            Arc::clone(arc)
+        };
+        let in_input_mode = is_focused && INPUT_MODE_ACTIVE.load(Ordering::Relaxed);
+        // Use try_lock to avoid blocking the render thread when WS or other
+        // threads hold the session lock — a blocked render freezes Ctrl+C too.
+        let Ok(mut session) = session_arc.try_lock() else {
+            // Lock contention — show a minimal placeholder and skip this frame.
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                .title(format!(" Session {} │ ⟳ ", self.session_id))
+                .style(Style::default().bg(theme::bg_primary()));
+            block.render(area, buf);
             return;
         };
-        let mut session = session_arc.lock().unwrap();
-        let in_input_mode = is_focused && state.input_mode_active;
 
         let is_awaiting = session.is_awaiting_permission();
         let is_running = session.is_running();
@@ -554,14 +593,20 @@ impl HypertilePlugin for ClaudePlugin {
     fn on_event(&mut self, event: &HypertileEvent) -> EventOutcome {
         // Tick: drain stream events + animate
         if matches!(event, HypertileEvent::Tick) {
-            let state = shared().lock().unwrap();
-            let Some(session_arc) = state.sessions.get(&self.session_id) else {
+            let session_arc = {
+                let Ok(sess) = sessions().try_lock() else {
+                    return EventOutcome::Ignored;
+                };
+                let Some(arc) = sess.get(&self.session_id) else {
+                    return EventOutcome::Ignored;
+                };
+                Arc::clone(arc)
+            };
+
+            // Use try_lock — if WS threads hold the lock, skip this tick
+            let Ok(mut session) = session_arc.try_lock() else {
                 return EventOutcome::Ignored;
             };
-            let session_arc = Arc::clone(session_arc);
-            drop(state);
-
-            let mut session = session_arc.lock().unwrap();
             session.tick_rain(); // always tick for cursor blink
             let drained = session.drain_events();
             let is_active = session.is_running();
@@ -577,14 +622,19 @@ impl HypertilePlugin for ClaudePlugin {
             return EventOutcome::Ignored;
         };
 
-        let state = shared().lock().unwrap();
-        let Some(session_arc) = state.sessions.get(&self.session_id) else {
+        let session_arc = {
+            let Ok(sess) = sessions().try_lock() else {
+                return EventOutcome::Ignored;
+            };
+            let Some(arc) = sess.get(&self.session_id) else {
+                return EventOutcome::Ignored;
+            };
+            Arc::clone(arc)
+        };
+
+        let Ok(mut session) = session_arc.try_lock() else {
             return EventOutcome::Ignored;
         };
-        let session_arc = Arc::clone(session_arc);
-        drop(state);
-
-        let mut session = session_arc.lock().unwrap();
 
         // Permission key interception
         if session.is_awaiting_permission() {
@@ -692,9 +742,10 @@ impl HypertilePlugin for ClaudePlugin {
                     ) {
                         debug_log(format!("[session {}] Send error: {}", sid, e));
                         // Safe to re-acquire: we dropped the guard above
-                        let mut s = session_arc.lock().unwrap();
-                        s.force_idle();
-                        s.output_lines.push(format!("  [error] {}", e));
+                        if let Ok(mut s) = session_arc.try_lock() {
+                            s.force_idle();
+                            s.output_lines.push(format!("  [error] {}", e));
+                        }
                     }
                 } else {
                     session.force_idle();
@@ -1278,7 +1329,15 @@ struct UsagePlugin;
 
 impl HypertilePlugin for UsagePlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
-        let state = shared().lock().unwrap();
+        let Ok(state) = shared().try_lock() else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                .title("  Token Usage Dashboard  ")
+                .style(Style::default().bg(theme::bg_primary()))
+                .render(area, buf);
+            return;
+        };
 
         let block = make_tile_block("  Token Usage Dashboard  ", theme::CYAN(), is_focused);
         let inner = block.inner(area);
@@ -1629,7 +1688,15 @@ impl DebugPlugin {
 
 impl HypertilePlugin for DebugPlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
-        let state = shared().lock().unwrap();
+        let Ok(state) = shared().try_lock() else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                .title("  Debug Log  ")
+                .style(Style::default().bg(theme::bg_primary()))
+                .render(area, buf);
+            return;
+        };
         let start = Instant::now();
 
         let filtered = self.filtered_indices(&state.debug_log);
@@ -1999,9 +2066,28 @@ impl SessionListPlugin {
 
 impl HypertilePlugin for SessionListPlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
-        let state = shared().lock().unwrap();
+        // Collect session arcs and drop shared() lock before locking sessions
+        // to avoid deadlock with WS/other threads.
+        let (session_count, session_entries) = {
+            let Ok(sess) = sessions().try_lock() else {
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                    .title("  Sessions  ")
+                    .style(Style::default().bg(theme::bg_primary()))
+                    .render(area, buf);
+                return;
+            };
+            let mut ids: Vec<usize> = sess.keys().copied().collect();
+            ids.sort();
+            let entries: Vec<(usize, Arc<Mutex<claude::ClaudeSession>>)> = ids
+                .iter()
+                .filter_map(|&id| sess.get(&id).map(|arc| (id, Arc::clone(arc))))
+                .collect();
+            (sess.len(), entries)
+        };
 
-        let title = format!("  Sessions ({})  ", state.sessions.len());
+        let title = format!("  Sessions ({})  ", session_count);
         let block = make_tile_block(title, theme::MAGENTA(), is_focused);
         let inner = block.inner(area);
         block.render(area, buf);
@@ -2052,13 +2138,9 @@ impl HypertilePlugin for SessionListPlugin {
             )),
         ];
 
-        // Sort sessions by id
-        let mut session_ids: Vec<usize> = state.sessions.keys().copied().collect();
-        session_ids.sort();
-
-        for (idx, &sid) in session_ids.iter().enumerate() {
-            if let Some(session_arc) = state.sessions.get(&sid) {
-                let session = session_arc.lock().unwrap();
+        for (idx, (sid, session_arc)) in session_entries.iter().enumerate() {
+                let Ok(session) = session_arc.try_lock() else { continue };
+                let sid = *sid;
                 let is_selected = is_focused && idx == self.selected;
 
                 let (status, status_color) = if session.is_awaiting_permission() {
@@ -2112,10 +2194,9 @@ impl HypertilePlugin for SessionListPlugin {
                         Style::default().fg(theme::text_muted()).bg(row_bg),
                     ),
                 ]));
-            }
         }
 
-        if session_ids.is_empty() {
+        if session_entries.is_empty() {
             lines.push(Line::from(Span::styled(
                 "   No active sessions",
                 Style::default().fg(theme::text_muted()),
@@ -2139,7 +2220,7 @@ impl HypertilePlugin for SessionListPlugin {
             return EventOutcome::Ignored;
         };
 
-        let session_count = shared().lock().unwrap().sessions.len();
+        let session_count = sessions().try_lock().map(|s| s.len()).unwrap_or(0);
 
         match key.code {
             HtKeyCode::Char('j') => {
@@ -2343,7 +2424,15 @@ impl WebSocketPlugin {
 
 impl HypertilePlugin for WebSocketPlugin {
     fn render(&self, area: Rect, buf: &mut Buffer, is_focused: bool) {
-        let state = shared().lock().unwrap();
+        let Ok(state) = shared().try_lock() else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::BORDER_NORMAL()))
+                .title("  WebSocket  ")
+                .style(Style::default().bg(theme::bg_primary()))
+                .render(area, buf);
+            return;
+        };
 
         let title = format!("  WebSocket [{}]  ", state.ws_status);
         let block = make_tile_block(title, theme::CYAN(), is_focused);
@@ -2689,7 +2778,7 @@ fn main() -> std::io::Result<()> {
     theme::load_saved();
 
     let mut terminal = ratatui::init();
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste)?;
 
     let mut workspace = WorkspaceRuntime::new(build_runtime);
 
@@ -2701,7 +2790,7 @@ fn main() -> std::io::Result<()> {
     let _ = rt.split_focused(Direction::Horizontal, "claude");
 
     let result = run(&mut terminal, &mut workspace);
-    crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+    crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste)?;
     ratatui::restore();
     result
 }
@@ -2713,14 +2802,40 @@ fn run(
     let tick_rate = Duration::from_millis(200);
     let mut last_tick = Instant::now();
 
+    // Spawn a dedicated thread to read crossterm events and send them via
+    // a channel. This avoids crossterm's internal event reader mutex which
+    // deadlocks when a tokio runtime runs in a background thread.
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+    std::thread::spawn(move || {
+        loop {
+            // Block on crossterm's read — this thread owns the event reader
+            match event::read() {
+                Ok(ev) => {
+                    if event_tx.send(ev).is_err() {
+                        break; // main thread dropped the receiver
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     loop {
-        // Sync input mode flag for plugins to read during render
-        {
-            let mode = workspace.active_runtime().mode();
-            let mut state = shared().lock().unwrap();
-            state.input_mode_active = mode == InputMode::PluginInput;
+        // Check atomic quit flag BEFORE draw — ensures exit even if previous
+        // render was slow due to mutex contention.
+        trace_log("loop:top");
+
+        if QUIT.load(Ordering::Relaxed) {
+            return Ok(());
         }
 
+        // Sync input mode flag for plugins to read during render (atomic — no lock needed)
+        {
+            let mode = workspace.active_runtime().mode();
+            INPUT_MODE_ACTIVE.store(mode == InputMode::PluginInput, Ordering::Relaxed);
+        }
+
+        trace_log("loop:draw_start");
         terminal.draw(|frame| {
             let [tabs, body, footer] = Layout::vertical([
                 Constraint::Length(1),
@@ -2807,55 +2922,86 @@ fn run(
             .render(hint_area, frame.buffer_mut());
 
             // Paint selection highlight over the buffer
-            let state = shared().lock().unwrap();
-            let sel = &state.selection;
-            if sel.has_selection() {
-                let (start, end) = sel.ordered();
-                let area = sel.pane_rect.unwrap_or(frame.area());
-                let mut selected_text = String::new();
+            if let Ok(state) = shared().try_lock() {
+                let sel = &state.selection;
+                if sel.has_selection() {
+                    let (start, end) = sel.ordered();
+                    let area = sel.pane_rect.unwrap_or(frame.area());
+                    let mut selected_text = String::new();
 
-                let buf = frame.buffer_mut();
-                for row in start.1..=end.1 {
-                    if row < area.y || row >= area.y + area.height {
-                        continue;
-                    }
-                    let col_start = if row == start.1 { start.0 } else { area.x };
-                    let col_end = if row == end.1 { end.0 } else { area.x + area.width - 1 };
-
-                    let mut row_text = String::new();
-                    for col in col_start..=col_end {
-                        if col < area.x || col >= area.x + area.width {
+                    let buf = frame.buffer_mut();
+                    for row in start.1..=end.1 {
+                        if row < area.y || row >= area.y + area.height {
                             continue;
                         }
-                        if let Some(cell) = buf.cell_mut((col, row)) {
-                            let _old_bg = cell.bg;
-                            cell.set_fg(Color::White);
-                            cell.set_bg(theme::BLUE());
-                            row_text.push_str(cell.symbol());
+                        let col_start = if row == start.1 { start.0 } else { area.x };
+                        let col_end = if row == end.1 { end.0 } else { area.x + area.width - 1 };
+
+                        let mut row_text = String::new();
+                        for col in col_start..=col_end {
+                            if col < area.x || col >= area.x + area.width {
+                                continue;
+                            }
+                            if let Some(cell) = buf.cell_mut((col, row)) {
+                                let _old_bg = cell.bg;
+                                cell.set_fg(Color::White);
+                                cell.set_bg(theme::BLUE());
+                                row_text.push_str(cell.symbol());
+                            }
+                        }
+                        if !selected_text.is_empty() {
+                            selected_text.push('\n');
+                        }
+                        selected_text.push_str(row_text.trim_end());
+                    }
+                    drop(state);
+
+                    // Store the extracted text for clipboard copy
+                    if !selected_text.is_empty() {
+                        if let Ok(mut state) = shared().try_lock() {
+                            state.selection.selected_text = selected_text;
                         }
                     }
-                    if !selected_text.is_empty() {
-                        selected_text.push('\n');
-                    }
-                    selected_text.push_str(row_text.trim_end());
-                }
-                drop(state);
-
-                // Store the extracted text for clipboard copy
-                if !selected_text.is_empty() {
-                    let mut state = shared().lock().unwrap();
-                    state.selection.selected_text = selected_text;
                 }
             }
         })?;
+
+        trace_log("loop:draw_done");
 
         let timeout = workspace.next_frame_in().map_or_else(
             || tick_rate.saturating_sub(last_tick.elapsed()),
             |frame| frame.min(tick_rate.saturating_sub(last_tick.elapsed())),
         );
 
-        if event::poll(timeout)? {
-            match event::read()? {
+        // Use try_recv + sleep to avoid any futex/condvar that might hang.
+        // Both crossterm's event::poll and mpsc::recv_timeout were observed
+        // hanging when a tokio runtime runs in a background thread.
+        let poll_deadline = Instant::now() + timeout;
+        let mut maybe_event = None;
+        while Instant::now() < poll_deadline {
+            match event_rx.try_recv() {
+                Ok(ev) => { maybe_event = Some(ev); break; }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+            if QUIT.load(Ordering::Relaxed) { return Ok(()); }
+        }
+        trace_log("loop:after_poll");
+        if let Some(ref ev) = maybe_event {
+            let desc = match ev {
+                Event::Key(k) => format!("Key({:?} mods={:?})", k.code, k.modifiers),
+                Event::Mouse(m) => format!("Mouse({:?})", m.kind),
+                Event::Resize(w, h) => format!("Resize({},{})", w, h),
+                Event::FocusGained => "FocusGained".into(),
+                Event::FocusLost => "FocusLost".into(),
+                _ => "Other".into(),
+            };
+            trace_log(&format!("loop:event={}", desc));
+        }
+        if let Some(ev) = maybe_event {
+            match ev {
                 Event::Key(key) => {
                     // Ctrl+Shift+C or Ctrl+C with selection = copy
                     // Note: some terminals report Ctrl+Shift+C as Char('C') with CONTROL,
@@ -2868,7 +3014,17 @@ fn run(
                         && key.modifiers == KeyModifiers::CONTROL;
 
                     if is_ctrl_shift_c || is_ctrl_c {
-                        let mut state = shared().lock().unwrap();
+                        let mut state = match shared().try_lock() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                // shared() contended — if Ctrl+C, force quit via atomic flag
+                                if is_ctrl_c {
+                                    QUIT.store(true, Ordering::Relaxed);
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        };
                         if !state.selection.selected_text.is_empty() {
                             let text = state.selection.selected_text.clone();
                             state.selection = TextSelection::default();
@@ -2889,6 +3045,7 @@ fn run(
                             if mode == InputMode::PluginInput {
                                 workspace.active_runtime_mut().set_mode(InputMode::Layout);
                             } else {
+                                QUIT.store(true, Ordering::Relaxed);
                                 return Ok(());
                             }
                             continue; // Don't forward to workspace
@@ -2996,12 +3153,33 @@ fn run(
                         _ => {}
                     }
                 }
+                Event::Paste(text) => {
+                    // Bracketed paste: send all chars at once to avoid per-char redraws
+                    for ch in text.chars() {
+                        workspace.handle_event(HypertileEvent::Key(
+                            KeyChord::new(HtKeyCode::Char(ch)),
+                        ));
+                    }
+                }
+                Event::FocusGained => {
+                    // Terminal was re-focused — force a full redraw since the
+                    // diff-based renderer may be stale after being backgrounded.
+                    terminal.clear()?;
+                }
+                Event::Resize(_, _) => {
+                    // Terminal resized — force full redraw
+                    terminal.clear()?;
+                }
                 _ => {}
             }
+            trace_log("loop:event_done");
         }
 
+        trace_log("loop:tick_check");
         if last_tick.elapsed() >= tick_rate {
+            trace_log("loop:before_tick");
             workspace.handle_event(HypertileEvent::Tick);
+            trace_log("loop:after_tick");
             last_tick = Instant::now();
         }
     }

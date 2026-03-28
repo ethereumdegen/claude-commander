@@ -3,6 +3,7 @@ name = "claude-commander"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+default-run = "claude-commander"
 
 [dependencies]
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
@@ -21,3 +22,11 @@ warp = "0.3"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures = "0.3"
 rand = "0.9"
+
+[[bin]]
+name = "claude-commander"
+path = "src/main.rs"
+
+[[bin]]
+name = "ws-client"
+path = "src/bin/ws-client.rs"
