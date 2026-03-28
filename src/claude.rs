@@ -399,16 +399,19 @@ impl ClaudeSession {
             self.output_lines.drain(..trim);
         }
 
-        // Watchdog: if Running with no events for 2 minutes, assume stuck
+        // Watchdog: if Running with no events for 5 minutes, assume stuck
         if matches!(self.state, SessionState::Running) {
             if let Some(last) = self.last_event_time {
-                if last.elapsed() > std::time::Duration::from_secs(120) {
-                    debug_log(format!("[error] Session {} timed out (2 min no events)", sid));
+                let elapsed = last.elapsed();
+                if elapsed > std::time::Duration::from_secs(300) {
+                    debug_log(format!("[error] Session {} timed out (5 min no events)", sid));
                     self.output_lines.push(
-                        "  [timed out — no response for 2 min, press Esc to cancel]".into(),
+                        "  [timed out — no response for 5 min, press Esc to cancel]".into(),
                     );
                     self.force_idle();
                     return true;
+                } else if elapsed > std::time::Duration::from_secs(60) && elapsed.as_secs() % 30 < 2 {
+                    debug_log(format!("[warn] Session {} no events for {}s", sid, elapsed.as_secs()));
                 }
             }
         }
@@ -609,8 +612,20 @@ fn parse_stream_line(line: &str) -> StreamEvent {
         // stream_event = streaming deltas (including during extended thinking).
         // Use non-empty sentinel so the watchdog treats it as a heartbeat.
         "stream_event" => StreamEvent::Stderr(" ".into()),
+        // rate_limit_event = API rate-limiting in progress; process is alive, just waiting.
+        // Use non-empty sentinel so the watchdog treats it as a heartbeat.
+        "rate_limit_event" => {
+            let retry_after = val.get("retry_after")
+                .and_then(|v| v.as_f64())
+                .or_else(|| val.get("retryAfter").and_then(|v| v.as_f64()));
+            if let Some(secs) = retry_after {
+                StreamEvent::Text(format!("[rate limited — retrying in {:.0}s]", secs))
+            } else {
+                StreamEvent::Stderr("[rate limited]".into())
+            }
+        }
         // Other benign types — truly silent (empty stderr won't reset watchdog)
-        "user" | "rate_limit_event" => StreamEvent::Stderr(String::new()),
+        "user" => StreamEvent::Stderr(String::new()),
         other => {
             StreamEvent::Stderr(format!("[unhandled: {}]", other))
         }

@@ -10,11 +10,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// File-based trace log for diagnosing freezes (works even when TUI is stuck).
-/// Writes to /tmp/claude-commander-trace.log
+/// Writes to /tmp/claude-commander-trace.log — use `tail -f` to monitor.
 fn trace_log(msg: &str) {
     use std::fs::OpenOptions;
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("/tmp/claude-commander-trace.log") {
-        let _ = writeln!(f, "[{:?}] {}", Instant::now(), msg);
+        use std::time::SystemTime;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs() % 86400; // time of day
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        let ms = now.subsec_millis();
+        let _ = writeln!(f, "[{:02}:{:02}:{:02}.{:03}] {}", h, m, s, ms, msg);
     }
 }
 
@@ -151,8 +160,10 @@ struct SharedState {
 }
 
 pub fn debug_log(msg: impl Into<String>) {
+    let msg = msg.into();
+    trace_log(&msg);
     if let Ok(mut state) = shared().try_lock() {
-        state.debug_log.push((Instant::now(), msg.into()));
+        state.debug_log.push((Instant::now(), msg));
         // Keep last 500 entries
         let len = state.debug_log.len();
         if len > 500 {
